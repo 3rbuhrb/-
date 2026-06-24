@@ -1,0 +1,843 @@
+/**
+ * @license
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+import { useState, useEffect, useRef } from 'react';
+import { 
+  Clock, 
+  UserCheck, 
+  KeyRound, 
+  FileText, 
+  User, 
+  HelpCircle,
+  Eye,
+  EyeOff,
+  QrCode,
+  Sparkles,
+  Search,
+  CheckCircle,
+  RotateCcw,
+  AlertCircle
+} from 'lucide-react';
+import { Employee, AttendanceLog } from '../types';
+import { Language, i18n, translate } from '../utils/lang';
+
+interface AttendanceConsoleProps {
+  employees: Employee[];
+  logsToday: AttendanceLog[];
+  onAddLog: (
+    employeeId: string, 
+    punchType: 'in' | 'out' | 'present' | 'permission' | 'leave', 
+    notes?: string
+  ) => { success: boolean; message: string; log?: AttendanceLog };
+  lang: Language;
+}
+
+export default function AttendanceConsole({ employees, logsToday, onAddLog, lang }: AttendanceConsoleProps) {
+  const t = (key: keyof typeof i18n['ar']) => {
+    return translate(lang, key);
+  };
+  const [pinCode, setPinCode] = useState('');
+  const [consoleFlowStep, setConsoleFlowStep] = useState<'welcome' | 'input_code' | 'success'>('input_code');
+  const [matchedEmployee, setMatchedEmployee] = useState<Employee | null>(null);
+  const [notes, setNotes] = useState('');
+  const [errorMessage, setErrorMessage] = useState('');
+  const [showPin, setShowPin] = useState(true);
+
+  // Enterprise QR Code Link states
+  const [copiedLink, setCopiedLink] = useState(false);
+  const mobilePortalUrl = typeof window !== 'undefined' ? `${window.location.origin}${window.location.pathname}?mode=mobile` : '';
+  const [qrCodeUrl, setQrCodeUrl] = useState(`https://api.qrserver.com/v1/create-qr-code/?size=160x160&data=${encodeURIComponent(mobilePortalUrl)}`);
+
+  useEffect(() => {
+    if (mobilePortalUrl) {
+      setQrCodeUrl(`https://api.qrserver.com/v1/create-qr-code/?size=160x160&data=${encodeURIComponent(mobilePortalUrl)}`);
+    }
+  }, [mobilePortalUrl]);
+
+  const handleCopyLink = () => {
+    navigator.clipboard.writeText(mobilePortalUrl);
+    setCopiedLink(true);
+    setTimeout(() => setCopiedLink(false), 2500);
+  };
+  
+  // Barcode / Scanner states
+  const [scannedInput, setScannedInput] = useState('');
+  const [lastScannedCode, setLastScannedCode] = useState('');
+  const [isScannerFocused, setIsScannerFocused] = useState(false);
+  const [showScanAnimation, setShowScanAnimation] = useState(false);
+  const [scanningStatusMsg, setScanningStatusMsg] = useState('');
+
+  // Live camera scanner states
+  const [scannerMode, setScannerMode] = useState<'simulated' | 'camera'>('simulated');
+  const [cameraError, setCameraError] = useState<string>('');
+  const [lastScannedTime, setLastScannedTime] = useState<number>(0);
+
+  // Handle camera QR / barcode scanning stream results
+  const handleCameraScan = (result: any, error: any) => {
+    if (result) {
+      const now = Date.now();
+      if (now - lastScannedTime < 3000) {
+        // Cooldown window of 3 seconds to avoid multiple sequential scans
+        return;
+      }
+
+      const scannedText = result.text?.trim() || '';
+      const sanitized = scannedText.replace(/\D/g, ''); // Extract numbers only if present
+
+      let codeToUse = '';
+      if (sanitized.length === 2) {
+        codeToUse = sanitized;
+      } else {
+        // Cross reference with active employee keys
+        const activeEmployees = employees.filter(e => e.isActive);
+        const match = activeEmployees.find(e => e.pinCode === scannedText || e.pinCode === sanitized);
+        if (match) {
+          codeToUse = match.pinCode;
+        }
+      }
+
+      if (codeToUse) {
+        setLastScannedTime(now);
+        triggerScanSuccess(codeToUse);
+      }
+    }
+
+    if (error) {
+      // Direct stream reading error callback, safe to silent as it fires on blank frames too
+      if (error?.name === 'NotAllowedError' || error?.name === 'PermissionDeniedError') {
+        if (!cameraError) {
+          setCameraError(lang === 'ar' ? 'تصريح الكاميرا مرفوض من المستخدم' : 'Camera access permission denied by user.');
+        }
+      }
+    }
+  };
+
+  const barcodeInputRef = useRef<HTMLInputElement>(null);
+
+  const [receipt, setReceipt] = useState<{
+    employeeName: string;
+    status: string;
+    time: string;
+    date: string;
+    noteUsed: string;
+  } | null>(null);
+
+  const [currentTime, setCurrentTime] = useState(new Date());
+
+  // Real-time Baghdad Clock
+  useEffect(() => {
+    const timer = setInterval(() => setCurrentTime(new Date()), 1000);
+    return () => clearInterval(timer);
+  }, []);
+
+  // Hello screen auto transition to code input screen after 1.5 seconds
+  useEffect(() => {
+    if (consoleFlowStep === 'welcome') {
+      const timer = setTimeout(() => {
+        setConsoleFlowStep('input_code');
+      }, 1500);
+      return () => clearTimeout(timer);
+    }
+  }, [consoleFlowStep]);
+
+  // Success screen auto transition back to code input screen after 4 seconds
+  useEffect(() => {
+    if (consoleFlowStep === 'success') {
+      const timer = setTimeout(() => {
+        setConsoleFlowStep('input_code');
+      }, 4000);
+      return () => clearTimeout(timer);
+    }
+  }, [consoleFlowStep]);
+
+  // Scan and search employee when PIN is typed (flexible 1-4 digits)
+  useEffect(() => {
+    if (pinCode.length >= 1) {
+      const activeEmployees = employees.filter(e => e.isActive);
+      const found = activeEmployees.find(e => {
+        // Strip leading zeros for lookup comparison to let "7" match "07" on all mobile systems
+        const cleanEmpPin = e.pinCode.replace(/^0+/, '');
+        const cleanInputPin = pinCode.replace(/^0+/, '');
+        return e.pinCode === pinCode || 
+               e.pinCode === pinCode.padStart(2, '0') || 
+               cleanEmpPin === cleanInputPin;
+      });
+      if (found) {
+        setMatchedEmployee(found);
+        setErrorMessage('');
+        setReceipt(null); // Clear previous receipt when starting new entry
+      } else {
+        setMatchedEmployee(null);
+        if (pinCode.length >= 2) {
+          setErrorMessage(lang === 'ar' ? 'الكود المدخل غير مطابق لأي موظف نشط!' : 'The code entered is not associated with any active employee!');
+        } else {
+          setErrorMessage('');
+        }
+      }
+    } else {
+      setMatchedEmployee(null);
+      setErrorMessage('');
+    }
+  }, [pinCode, employees, lang]);
+
+  // Handle barcode reader keyboard input (for rapid scan simulation or external hardware reader)
+  const handleBarcodeSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    const sanitized = scannedInput.trim().replace(/\D/g, ''); // Keep only numbers
+    if (sanitized.length >= 1 && sanitized.length <= 4) {
+      triggerScanSuccess(sanitized);
+    } else if (sanitized.length > 0) {
+      setScanningStatusMsg(lang === 'ar' ? 'خطأ: كود البصمة أو الباركود يجب أن يتكون من 1 إلى 4 أرقام!' : 'Error: Attendance code or barcode must be between 1 and 4 digits.');
+      setTimeout(() => setScanningStatusMsg(''), 4000);
+    }
+    setScannedInput('');
+  };
+
+  // Helper to trigger interactive laser animation on scan
+  const triggerScanSuccess = (code: string) => {
+    setLastScannedCode(code);
+    setShowScanAnimation(true);
+    setScanningStatusMsg(lang === 'ar' ? 'جاري قراءة الباركود ضوئياً وتحديد هوية الموظف...' : 'Scanning laser barcode and recognizing staff identity...');
+    
+    setTimeout(() => {
+      setShowScanAnimation(false);
+      const activeEmployees = employees.filter(e => e.isActive);
+      const found = activeEmployees.find(e => {
+        const cleanEmpPin = e.pinCode.replace(/^0+/, '');
+        const cleanCode = code.replace(/^0+/, '');
+        return e.pinCode === code || e.pinCode === code.padStart(2, '0') || cleanEmpPin === cleanCode;
+      });
+      if (found) {
+        setPinCode(found.pinCode);
+        setScanningStatusMsg(lang === 'ar' ? `تم رصد بطاقة الموظف: ${found.name} بنجاح!` : `Successfully scanned employee card for: ${found.name}`);
+        setErrorMessage('');
+        setReceipt(null);
+
+        // Immediate automatic registration on barcode scan!
+        const existingLog = logsToday.find(l => l.employeeId === found.id);
+        const punchType = (existingLog && existingLog.checkIn && !existingLog.checkOut) ? 'out' : 'present';
+        const autoNotes = lang === 'ar' ? 'سحب تلقائي بالباركود' : 'Automated barcode swipe';
+        const result = onAddLog(found.id, punchType, autoNotes);
+
+        if (result.success && result.log) {
+          playSuccessSound();
+          const formattedTime = currentTime.toLocaleTimeString('en-US', { hour12: false });
+          const formattedDate = currentTime.toLocaleDateString(lang === 'ar' ? 'ar-EG' : 'en-US', { 
+            weekday: 'long', 
+            year: 'numeric', 
+            month: 'long', 
+            day: 'numeric' 
+          });
+
+          const statusLabels: Record<string, string> = {
+            'Present': lang === 'ar' ? 'حضور كامل (منتظم)' : 'Full Check-in (On-time)',
+            'Late': lang === 'ar' ? 'حضور متأخر' : 'Late Arrival',
+            'Permission': lang === 'ar' ? 'أذن زمنية معتمدة' : 'Authorized Time Permission',
+            'On Leave': lang === 'ar' ? 'إجازة سنوية/مرضية معتمدة' : 'Official Annual/Sick Leave'
+          };
+
+          setReceipt({
+            employeeName: found.name,
+            status: statusLabels[result.log.status] || result.log.status,
+            time: formattedTime,
+            date: formattedDate,
+            noteUsed: autoNotes,
+          });
+
+          // Reset temporary input, transition straight to success receipt card screen
+          setPinCode('');
+          setMatchedEmployee(null);
+          setNotes('');
+          setErrorMessage('');
+          setScanningStatusMsg('');
+          setConsoleFlowStep('success');
+        } else {
+          setErrorMessage(result.message || (lang === 'ar' ? 'فشل تسجيل حضور الموظف آلياً' : 'Could not register employee attendance automatically.'));
+        }
+      } else {
+        setScanningStatusMsg('');
+        setErrorMessage(lang === 'ar' ? `الكود الممسوح بالباركود (#${code}) غير مطابق لأي موظف نشط!` : `Scanned barcode (#${code}) is not associated with any active employee.`);
+      }
+    }, 850);
+  };
+
+  // Handle number pad tape click
+  const handleNumberClick = (num: string) => {
+    if (receipt) setReceipt(null); // reset invoice if present
+    if (pinCode.length < 4) {
+      setPinCode(prev => prev + num);
+    }
+  };
+
+  // Clear PIN code
+  const handleClear = () => {
+    setPinCode('');
+    setMatchedEmployee(null);
+    setErrorMessage('');
+    setNotes('');
+    setScannedInput('');
+    setScanningStatusMsg('');
+  };
+
+  // Sound prompt upon successful registration
+  const playSuccessSound = () => {
+    try {
+      const AudioContext = window.AudioContext || (window as any).webkitAudioContext;
+      if (!AudioContext) return;
+      const ctx = new AudioContext();
+      
+      const playNote = (freq: number, start: number, duration: number) => {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(freq, start);
+        
+        gain.gain.setValueAtTime(0.15, start);
+        gain.gain.exponentialRampToValueAtTime(0.001, start + duration);
+        
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.start(start);
+        osc.stop(start + duration);
+      };
+
+      const now = ctx.currentTime;
+      // High-quality double chime
+      playNote(659.25, now, 0.15); // E5
+      playNote(880.00, now + 0.1, 0.4); // A5
+    } catch (e) {
+      console.error("Audio playback failed", e);
+    }
+  };
+
+  // Perform immediate registration with 1 of 3 options
+  const handleStatusRegister = (type: 'present' | 'permission' | 'leave') => {
+    if (!matchedEmployee) return;
+
+    const result = onAddLog(matchedEmployee.id, type, notes);
+    
+    if (result.success && result.log) {
+      // Play system chime
+      playSuccessSound();
+      const formattedTime = currentTime.toLocaleTimeString('en-US', { hour12: false });
+      const formattedDate = currentTime.toLocaleDateString(lang === 'ar' ? 'ar-EG' : 'en-US', { 
+        weekday: 'long', 
+        year: 'numeric', 
+        month: 'long', 
+        day: 'numeric' 
+      });
+
+      const statusLabels: Record<string, string> = {
+        'Present': lang === 'ar' ? 'حضور كامل (منتظم)' : 'Full Check-in (On-time)',
+        'Late': lang === 'ar' ? 'حضور متأخر' : 'Late Arrival',
+        'Permission': lang === 'ar' ? 'أذن زمنية معتمدة' : 'Authorized Time Permission',
+        'On Leave': lang === 'ar' ? 'إجازة سنوية/مرضية معتمدة' : 'Official Annual/Sick Leave'
+      };
+
+      setReceipt({
+        employeeName: matchedEmployee.name,
+        status: statusLabels[result.log.status] || result.log.status,
+        time: formattedTime,
+        date: formattedDate,
+        noteUsed: notes || (lang === 'ar' ? 'لا يوجد ملاحظات إضافية' : 'No additional logs/notes'),
+      });
+
+      // Reset keyboard input
+      setPinCode('');
+      setMatchedEmployee(null);
+      setNotes('');
+      setErrorMessage('');
+      setScanningStatusMsg('');
+      setConsoleFlowStep('success');
+
+    } else {
+      alert(result.message);
+    }
+  };
+
+
+  return (
+    <div id="attendance-console-layout" className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+      
+      {/* Left panel: Dial Pad and User Selection Context */}
+      <div className="lg:col-span-8 bg-white border border-slate-200 p-6 rounded-2xl shadow-xs flex flex-col justify-between min-h-[500px]">
+        
+        {consoleFlowStep === 'welcome' && (
+          <div className="flex flex-col items-center justify-center text-center my-auto py-16 space-y-6 animate-scale-up">
+            <div className="h-20 w-20 rounded-full bg-blue-50 text-blue-600 flex items-center justify-center border border-blue-105 animate-pulse">
+              <Clock className="h-10 w-10 text-blue-600" />
+            </div>
+            
+            <div className="space-y-3">
+              <h1 className="text-5xl font-black tracking-tight text-slate-900 font-sans">
+                Hello
+              </h1>
+              <p className="text-slate-550 text-xs font-bold max-w-sm">
+                Ready to clock-in? We are directing you to the code input screen...
+              </p>
+            </div>
+
+            <div className="pt-2">
+              <button
+                onClick={() => setConsoleFlowStep('input_code')}
+                className="px-6 py-3 bg-blue-600 hover:bg-blue-700 active:scale-95 text-white font-extrabold text-xs rounded-xl tracking-wider transition-all shadow-md cursor-pointer uppercase flex items-center gap-2 mx-auto"
+              >
+                <span>Enter Code Now</span>
+                <span>→</span>
+              </button>
+            </div>
+          </div>
+        )}
+
+        {consoleFlowStep === 'success' && (
+          <div className="flex flex-col items-center justify-center text-center my-auto py-16 space-y-6 animate-scale-up">
+            <div className="h-20 w-20 rounded-full bg-emerald-50 text-emerald-600 flex items-center justify-center border border-emerald-100 animate-bounce">
+              <CheckCircle className="h-11 w-11" />
+            </div>
+            
+            <div className="space-y-3">
+              <h2 className="text-2xl font-black text-slate-900 leading-tight">
+                Registration completed successfully.
+              </h2>
+              <p className="text-sm font-bold text-emerald-600 animate-pulse tracking-wide">
+                تمت عملية تسجيل الحضور بنجاح
+              </p>
+            </div>
+
+            <div className="pt-4 flex flex-col items-center gap-2">
+              <button
+                onClick={() => {
+                  setConsoleFlowStep('input_code');
+                  setReceipt(null);
+                }}
+                className="px-5 py-2.5 bg-slate-800 hover:bg-slate-700 active:scale-95 text-white font-extrabold text-xs rounded-xl transition-all cursor-pointer shadow-sm"
+              >
+                Done
+              </button>
+              <span className="text-[10px] text-slate-400 font-semibold uppercase tracking-wide">
+                {lang === 'ar' ? 'العودة لواجهة تسجيل الدخول خلال ثوانٍ...' : 'Returning to entry screen in a few seconds...'}
+              </span>
+            </div>
+          </div>
+        )}
+
+        {consoleFlowStep === 'input_code' && (
+          <>
+            {/* Upper segment */}
+            <div>
+          {/* Header & Clock info */}
+          <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center border-b border-slate-100 pb-5 mb-5 gap-4">
+            <div>
+              <h2 className="text-base font-extrabold text-slate-800 flex items-center gap-2">
+                <span className="h-2.5 w-2.5 rounded-full bg-blue-600 animate-pulse"></span>
+                {t('console_title')}
+              </h2>
+              <p className="text-[11px] text-slate-500 font-bold mt-1">
+                {t('console_desc')}
+              </p>
+            </div>
+
+            {/* Live Clock Display */}
+            <div className="flex items-center gap-3 bg-slate-50 border border-slate-200 px-4 py-2 rounded-xl">
+              <Clock className="h-5 w-5 text-blue-600 animate-pulse" />
+              <div className="text-right">
+                <p className="text-xs font-bold font-mono text-slate-800">
+                  {currentTime.toLocaleTimeString('en-US', { hour12: false })}
+                </p>
+                <p className="text-[9.5px] text-slate-400 font-bold mt-0.5 animate-pulse">
+                  {currentTime.toLocaleDateString(lang === 'ar' ? 'ar-EG' : 'en-US', { day: 'numeric', month: 'short', year: 'numeric' })}
+                </p>
+              </div>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-12 gap-6 items-start">
+            
+            {/* PIN keypad container & Barcode Laser Box */}
+            <div className="md:col-span-6 space-y-4">
+              
+              {/* ADVANCED BARCODE SCANNER EMULATOR BOX */}
+              <div className="bg-slate-900 text-white rounded-2xl p-4.5 border border-slate-800 shadow-sm relative overflow-hidden">
+                <div className="absolute top-2 left-2 bg-blue-500 text-[8.5px] px-1.5 py-0.5 rounded font-extrabold flex items-center gap-1">
+                  <span className="h-1.5 w-1.5 bg-white rounded-full animate-ping"></span>
+                  {lang === 'ar' ? 'قارئ الباركود النشط' : 'Scanner Active'}
+                </div>
+
+                <h3 className="text-xs font-extrabold text-blue-400 flex items-center gap-1.5 mb-4">
+                  <QrCode className="h-4.5 w-4.5" />
+                  {lang === 'ar' ? 'منصة القراءة والمسح الإلكتروني للبطاقات' : 'Laser Attendance Badge Decoder'}
+                </h3>
+
+                {/* Simulated Camera Scanner and text box input */}
+                <form onSubmit={handleBarcodeSubmit} className="space-y-3 relative">
+                  <div className="relative">
+                    <input
+                      ref={barcodeInputRef}
+                      type="text"
+                      maxLength={4}
+                      placeholder={lang === 'ar' ? 'وجه الباركود نحو الكاميرا أو اكتبه هنا...' : 'Aim barcode to camera, or write pin...'}
+                      value={scannedInput}
+                      onChange={(e) => {
+                        const val = e.target.value.replace(/\D/g, '');
+                        setScannedInput(val);
+                        // If type 2 digits automatically trigger success
+                        if (val.length === 2) {
+                          triggerScanSuccess(val);
+                          setScannedInput('');
+                        }
+                      }}
+                      onFocus={() => setIsScannerFocused(true)}
+                      onBlur={() => setIsScannerFocused(false)}
+                      className="w-full text-xs py-3 px-3.5 pl-10 bg-slate-950 border border-slate-800 rounded-xl text-center font-mono font-bold text-emerald-400 placeholder-slate-550 focus:outline-hidden focus:border-blue-500 tracking-widest"
+                    />
+                    <div className="absolute left-3.5 top-3 text-slate-500">
+                      <Search className="h-4.5 w-4.5" />
+                    </div>
+                  </div>
+
+                  {/* Red Laser Scanning line Animation */}
+                  <div className="h-20 bg-slate-950 rounded-xl flex items-center justify-center relative border border-slate-800/80 overflow-hidden">
+                                        {isScannerFocused ? (
+                      <span className="absolute top-1 right-2 text-[8px] text-emerald-500 font-bold">● {lang === 'ar' ? 'القارئ جاهز لاستقبال المسحات' : 'Reader ready for scanner signal'}</span>
+                    ) : (
+                      <button 
+                        type="button"
+                        onClick={() => barcodeInputRef.current?.focus()}
+                        className="absolute top-1 right-2 text-[8px] text-rose-400 hover:text-rose-300 font-bold cursor-pointer"
+                      >
+                        ● {lang === 'ar' ? 'انقر هنا لتفعيل قراءة الباركود مبرمجاً' : 'Click here to capture focus'}
+                      </button>
+                    )}
+
+                    <div className="text-center">
+                      <div className="flex justify-center gap-1.5 mb-1.5 opacity-60">
+                        <span className="w-1 h-8 bg-slate-600"></span>
+                        <span className="w-1.5 h-8 bg-slate-500"></span>
+                        <span className="w-0.5 h-8 bg-slate-600"></span>
+                        <span className="w-2.5 h-8 bg-slate-400"></span>
+                        <span className="w-1 h-8 bg-slate-600"></span>
+                        <span className="w-1.5 h-8 bg-slate-500"></span>
+                        <span className="w-0.5 h-8 bg-slate-600"></span>
+                        <span className="w-2.5 h-8 bg-slate-400"></span>
+                      </div>
+                      <span className="text-[10px] text-slate-400 font-extrabold">
+                        {lang === 'ar' ? 'الباركود النشط: ' : 'Active Barcode: '}{lastScannedCode ? `#${lastScannedCode}` : (lang === 'ar' ? 'بانتظار بطاقة الموظف' : 'Awaiting employee card')}
+                      </span>
+                    </div>
+                  </div>
+                </form>
+
+                {scanningStatusMsg && (
+                  <div className="mt-2 text-[9.5px] font-extrabold text-emerald-400 text-center animate-pulse bg-slate-950/50 p-1.5 rounded-lg border border-emerald-950">
+                    {scanningStatusMsg}
+                  </div>
+                )}
+              </div>
+
+              {/* PIN Code Box Input fallback */}
+              <div className="p-4 bg-slate-50 rounded-2xl border border-slate-100 flex flex-col items-center">
+                <span className="text-[10px] font-extrabold text-slate-500 mb-2 uppercase tracking-wide">
+                  {lang === 'ar' ? 'أو ادخل كودك يدوياً (حتى 4 أرقام)' : 'Or insert authentication PIN manually (up to 4 digits)'}
+                </span>
+                
+                {/* Digit View Box */}
+                <div className="relative flex items-center justify-center gap-3 bg-white border border-slate-200 rounded-xl px-5 py-3 w-full shadow-inner mb-3">
+                  <div className="text-center font-mono text-lg font-extrabold tracking-widest text-slate-800 h-7 flex items-center justify-center">
+                    {pinCode.length === 0 && <span className="text-slate-350 text-xs select-none">Enter Code (1-4 digits)</span>}
+                    {pinCode.length > 0 && (showPin ? pinCode : '●'.repeat(pinCode.length))}
+                  </div>
+
+                  {pinCode.length > 0 && (
+                    <button 
+                      onClick={() => setShowPin(!showPin)}
+                      className="absolute right-3 p-1 text-slate-400 hover:text-slate-650 rounded transition-colors"
+                    >
+                      {showPin ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+                    </button>
+                  )}
+                </div>
+
+                {/* Highly visible custom label requested by user */}
+                <div className="text-center mb-3 animate-pulse">
+                  <span className="text-xs font-black text-blue-600 tracking-widest uppercase font-mono block">
+                    Enter your code
+                  </span>
+                </div>
+
+                {/* Pad grid */}
+                <div className="grid grid-cols-3 gap-2 w-full">
+                  {['1', '2', '3', '4', '5', '6', '7', '8', '9'].map(num => (
+                    <button
+                      key={num}
+                      onClick={() => handleNumberClick(num)}
+                      className="h-10 text-xs font-extrabold text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-100 hover:border-slate-300 active:bg-blue-50 active:text-blue-600 transition-all shadow-2xs"
+                    >
+                      {num}
+                    </button>
+                  ))}
+                  {/* Clear Button */}
+                  <button
+                    onClick={handleClear}
+                    className="h-10 text-[10px] font-bold text-rose-650 bg-rose-50 border border-rose-100 rounded-lg hover:bg-rose-100 active:scale-95 transition-all text-center"
+                  >
+                    مسح
+                  </button>
+                  {/* Digit 0 */}
+                  <button
+                    onClick={() => handleNumberClick('0')}
+                    className="h-10 text-xs font-extrabold text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-100 hover:border-slate-300 active:bg-blue-50 active:text-blue-600 transition-all shadow-2xs"
+                  >
+                    0
+                  </button>
+                  {/* Reset/Back */}
+                  <button
+                    onClick={handleClear}
+                    className="h-10 bg-slate-100 hover:bg-slate-200 border border-slate-200 rounded-lg flex items-center justify-center text-slate-600 transition-colors"
+                    title="تفريغ"
+                  >
+                    <RotateCcw className="h-3.5 w-3.5" />
+                  </button>
+                </div>
+
+                {errorMessage && (
+                  <div className="mt-2.5 text-[9.5px] font-extrabold text-rose-600 bg-rose-50 border border-rose-100 px-3 py-1.5 rounded-lg text-center w-full animate-pulse">
+                    {errorMessage}
+                  </div>
+                )}
+              </div>
+
+            </div>
+
+            {/* Interactive verification status and choices */}
+            <div className="md:col-span-6 space-y-4">
+              {matchedEmployee ? (
+                <div className="bg-blue-50/50 border border-blue-100 p-5 rounded-2xl shadow-2xs space-y-4 animate-scale-up text-right">
+                  {/* Profile info of match */}
+                  <div className="flex items-center gap-3 pb-3 border-b border-blue-100/60">
+                    <div className="h-11 w-11 rounded-xl bg-blue-600 text-white font-extrabold text-sm flex items-center justify-center shadow-xs">
+                      <User className="h-5 w-5" />
+                    </div>
+                    <div>
+                      <span className="text-[9px] font-extrabold text-blue-500 block uppercase tracking-wide">الملف الشخصي المطابق للرمز #{pinCode}</span>
+                      <h3 className="text-sm font-extrabold text-slate-800 mt-0.5">{matchedEmployee.name}</h3>
+                      <p className="text-[10px] text-slate-500 font-bold mt-0.5">{matchedEmployee.role} — {matchedEmployee.department}</p>
+                    </div>
+                  </div>
+
+                  {/* Manual notes input for checking in */}
+                  <div>
+                    <label className="block text-[10px] font-extrabold text-slate-500 mb-1">أضف ملاحظة شفهية / سبب أو عذر (اختياري)</label>
+                    <input
+                      type="text"
+                      value={notes}
+                      onChange={(e) => setNotes(e.target.value)}
+                      placeholder="تأخير بسبب الازدحام المروري، أو مراجعة عائلية..."
+                      className="w-full text-xs px-3 py-2 bg-white border border-slate-200 rounded-lg text-right font-semibold placeholder-slate-350 focus:outline-hidden focus:border-blue-500"
+                    />
+                  </div>
+
+                  {/* The 3 Options required by user */}
+                  <div className="space-y-2 pt-1">
+                    <p className="text-[9.5px] font-extrabold text-slate-400">حدد الإجراء المطلوب لتسجيل حركتك فوراً:</p>
+                    
+                    <div className="grid grid-cols-1 gap-2.5">
+                      {/* Option 1: حضور */}
+                      <button
+                        onClick={() => handleStatusRegister('present')}
+                        className="py-3 px-4 bg-emerald-600 hover:bg-emerald-700 text-white active:scale-98 rounded-xl font-extrabold text-xs transition-all flex justify-between items-center px-4 cursor-pointer shadow-xs border border-emerald-500"
+                      >
+                        <span className="text-[9px] bg-emerald-500 text-white px-2 py-0.5 rounded">الاختبار الأول</span>
+                        <span className="text-xs font-bold">تسجيل حضور صباحي</span>
+                      </button>
+
+                      {/* Option 2: زمنية */}
+                      <button
+                        onClick={() => handleStatusRegister('permission')}
+                        className="py-3 px-4 bg-amber-500 hover:bg-amber-600 text-white active:scale-98 rounded-xl font-extrabold text-xs transition-all flex justify-between items-center px-4 cursor-pointer shadow-xs border border-amber-400"
+                      >
+                        <span className="text-[9px] bg-amber-450 text-white px-2 py-0.5 rounded">الاختبار الثاني</span>
+                        <span className="text-xs font-bold">تسجيل أذن برخصة زمنية</span>
+                      </button>
+
+                      {/* Option 3: إجازة */}
+                      <button
+                        onClick={() => handleStatusRegister('leave')}
+                        className="py-3 px-4 bg-indigo-650 hover:bg-indigo-700 text-white active:scale-98 rounded-xl font-extrabold text-xs transition-all flex justify-between items-center px-4 cursor-pointer shadow-xs border border-indigo-600"
+                      >
+                        <span className="text-[9px] bg-indigo-500 text-white px-2 py-0.5 rounded">الاختبار الثالث</span>
+                        <span className="text-xs font-bold">أجازة اعتيادية / مرضية اليوم</span>
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="text-center pt-1">
+                    <button 
+                      onClick={handleClear}
+                      className="text-[9.5px] font-extrabold text-slate-550 hover:text-rose-600 transition-colors bg-white px-3 py-1.5 rounded-lg border border-slate-250"
+                    >
+                      تراجع وإلغاء التسجيل
+                    </button>
+                  </div>
+
+                </div>
+              ) : (
+                <div className="bg-slate-50/50 border border-slate-150 p-6 rounded-2xl flex flex-col items-center justify-center text-center h-full min-h-[300px] select-none">
+                  <div className="h-12 w-12 rounded-full bg-slate-100 text-slate-400 mb-4 flex items-center justify-center border border-slate-200 animate-pulse">
+                    <KeyRound className="h-5.5 w-5.5" />
+                  </div>
+                  <h4 className="text-xs font-extrabold text-slate-700">بانتظار التعرف على الكود أو المسح</h4>
+                  <p className="text-[10.5px] text-slate-400 max-w-[280px] mt-2 leading-relaxed font-semibold">
+                    فضلًا، ادخل الكود المكون من رقمين (مثل 01 أو 02) عبر لوحة الأرقام، أو قم بمسح بطاقتك مباشرة عبر قارئ البصمة لتحديد هويتك وعرض خيارات الحضور الفورية.
+                  </p>
+
+                  <div className="mt-5 border border-dashed border-slate-200 p-3 rounded-lg w-full bg-white/50 text-right">
+                    <h5 className="text-[10px] font-extrabold text-slate-600 flex items-center gap-1 mb-1">
+                      <Sparkles className="h-3.5 w-3.5 text-blue-500" />
+                      ميزة المسح السريع بالباركود:
+                    </h5>
+                    <p className="text-[9.5px] text-slate-400 font-semibold leading-relaxed">
+                      انقر فوق أي من بطاقات الموظفين المعروضة في القائمة الجانبية اليسرى لمحاكاة دقيقة للغاية لعملية مسح بطاقة الباركود الفيزيائية بالليزر الأحمر!
+                    </p>
+                  </div>
+                </div>
+              )}
+            </div>
+
+          </div>
+        </div>
+
+            {/* Footer info snippet with internal guidelines */}
+            <div className="mt-6 border-t border-slate-100 pt-4 flex flex-col sm:flex-row justify-between text-[11px] text-slate-400 font-bold gap-2">
+              <p className="flex items-center gap-1.5">
+                <span className="h-1.5 w-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
+                جاهزية النظام: قارئ البصمة وجهاز الباركود متصل وآمن
+              </p>
+              <p className="flex items-center gap-1 text-slate-500">
+                <HelpCircle className="h-3.5 w-3.5 text-blue-500" />
+                انقر على لوحة المفاتيح أو استخدم قارئ الباركود المعلق لتسجيل البصمة.
+              </p>
+            </div>
+          </>
+        )}
+
+      </div>
+
+      {/* Right panel: Digital Receipt & Quick Demo Guide Code Sheet with Barcode Graphics */}
+      <div className="lg:col-span-4 flex flex-col gap-6">
+        
+        {/* Receipt segment */}
+        {receipt && (
+          <div className="bg-white border-2 border-emerald-500 p-6 rounded-2xl shadow-md relative overflow-hidden animate-scale-up text-right">
+            <div className="flex justify-between items-start border-b border-slate-100 pb-3 mb-3">
+              <div className="bg-emerald-50 p-2 rounded-xl text-emerald-600 border border-emerald-150">
+                <UserCheck className="h-4.5 w-4.5" />
+              </div>
+              <div className="text-right">
+                <span className="bg-emerald-500 text-white text-[9.5px] px-2.5 py-1 rounded font-bold animate-pulse">
+                  تم الحفظ والتسجيل الفوري
+                </span>
+                <p className="text-[8.5px] text-slate-450 font-mono font-bold mt-1.5">الرقم المرجعي: #{Math.floor(10000 + Math.random() * 90000)}</p>
+              </div>
+            </div>
+
+            <div className="space-y-3.5">
+              <div>
+                <span className="text-[9px] font-extrabold text-slate-400 block">الموظف المسئول</span>
+                <span className="text-xs font-extrabold text-slate-800 mt-0.5">{receipt.employeeName}</span>
+              </div>
+
+              <div className="grid grid-cols-2 gap-2 border-t border-b border-slate-100 py-2.5">
+                <div>
+                  <span className="text-[9px] font-extrabold text-slate-400 block">الحالة المدونة</span>
+                  <span className="text-[10.5px] font-extrabold text-emerald-600 mt-0.5 inline-block">{receipt.status}</span>
+                </div>
+                <div>
+                  <span className="text-[9px] font-extrabold text-slate-400 block">وقت المعالجة</span>
+                  <span className="text-[10.5px] font-extrabold text-slate-700 mt-0.5 inline-block font-mono">{receipt.time}</span>
+                </div>
+              </div>
+
+              <div>
+                <span className="text-[9px] font-extrabold text-slate-400 block">الملاحظة أو العذر</span>
+                <span className="text-[10px] text-slate-600 mt-0.5 block font-medium leading-relaxed bg-slate-50 p-2 rounded border border-slate-100">
+                  {receipt.noteUsed}
+                </span>
+              </div>
+
+              <div>
+                <span className="text-[9px] font-extrabold text-slate-400 block">تاريخ القيد الإداري</span>
+                <span className="text-[10px] font-extrabold text-slate-600 mt-0.5 block font-mono">
+                  {receipt.date}
+                </span>
+              </div>
+            </div>
+
+            {/* Stamp design */}
+            <span className="absolute -bottom-6 -left-6 w-20 h-20 rounded-full border-4 border-emerald-500/15 flex items-center justify-center text-[9px] font-extrabold text-emerald-500/20 rotate-12 bg-emerald-50/5 select-none pointer-events-none">
+              OK PASS
+            </span>
+          </div>
+        )}
+
+        {/* MOBILITY QR CODE GATEWAY CARD */}
+        <div id="enterprise-qr-portal-card" className="bg-gradient-to-br from-slate-900 via-slate-950 to-slate-900 text-white p-5 rounded-2xl border border-slate-800 shadow-lg select-none space-y-4 text-right">
+          <div className="flex justify-between items-start border-b border-slate-800 pb-3">
+            <div>
+              <h3 className="text-xs font-extrabold text-blue-400 flex items-center gap-1.5 uppercase tracking-wide">
+                <span className="p-1 rounded bg-blue-500/10 text-blue-400 text-xs">📲</span>
+                بوابة الحضور السريعة للجوال (QR)
+              </h3>
+              <p className="text-[10px] text-slate-400 mt-1 leading-relaxed font-semibold">
+                امسح الكود بكاميرا هاتفك المحمول للدخول المباشر وتسجيل دوامك ذاتياً دون لمس لوحة الإدارة!
+              </p>
+            </div>
+          </div>
+
+          <div className="flex flex-col items-center justify-center bg-slate-950 p-4 rounded-xl border border-slate-900 space-y-2.5">
+            <div className="bg-white p-3.5 rounded-2xl border border-slate-800 shadow-inner flex items-center justify-center">
+              <img 
+                src={qrCodeUrl}
+                onError={() => {
+                  if (qrCodeUrl.includes('api.qrserver.com')) {
+                    setQrCodeUrl(`https://quickchart.io/qr?size=160&text=${encodeURIComponent(mobilePortalUrl)}`);
+                  }
+                }}
+                alt="بوابة الحضور للجوال"
+                className="w-32 h-32 select-none"
+                referrerPolicy="no-referrer"
+              />
+            </div>
+            <p className="text-[9.5px] text-slate-400 font-extrabold text-center inline-flex items-center gap-1">
+              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping"></span>
+              رمز الدخول السريع للمؤسسة
+            </p>
+          </div>
+
+          <div className="grid grid-cols-2 gap-2 text-center">
+            <button
+              type="button"
+              onClick={handleCopyLink}
+              className="py-2.5 px-3 bg-slate-900 hover:bg-slate-800 text-slate-300 hover:text-white rounded-xl text-[10px] font-extrabold transition-all cursor-pointer border border-slate-800 flex items-center justify-center gap-1"
+            >
+              🚀 {copiedLink ? 'تم نسخ الرابط!' : 'نسخ رابط البصمة'}
+            </button>
+            <a
+              href={mobilePortalUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="py-2.5 px-3 bg-blue-600 hover:bg-blue-500 text-white rounded-xl text-[10px] font-extrabold transition-all flex items-center justify-center gap-1"
+            >
+              🔗 فتح واجهة الجوال
+            </a>
+          </div>
+        </div>
+
+
+
+      </div>
+
+    </div>
+  );
+}
